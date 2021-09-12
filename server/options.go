@@ -25,8 +25,9 @@ type Options struct {
 	LogFile    string      `json:"-"`
 	Routes     []*url.URL  `json:"-"`
 
-	TLS       bool        `json:-`
-	TLSConfig *tls.Config `json:"-"`
+	TLS           bool          `json:-`
+	TLSConfig     *tls.Config   `json:"-"`
+	WriteDeadline time.Duration `json:"-"`
 }
 
 type ClusterOpts struct {

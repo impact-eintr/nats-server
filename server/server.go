@@ -26,6 +26,7 @@ type Info struct {
 }
 
 type Server struct {
+	stats
 	mu sync.Mutex // Server的全局互斥锁
 
 	info     Info
@@ -59,6 +60,14 @@ type Server struct {
 		trace  int32
 		debug  int32
 	}
+}
+
+type stats struct {
+	inMsgs        int64
+	outMsgs       int64
+	inBytes       int64
+	outBytes      int64
+	slowConsumers int64
 }
 
 func New(opt *Options) *Server {
