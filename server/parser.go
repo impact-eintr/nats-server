@@ -483,10 +483,10 @@ func (c *client) parse(buf []byte) error {
 				}
 				c.drop, c.as, c.state = 0, i+1, MSG_PAYLOAD
 
-				// jump ahead with the index. If this overruns
+				// jump ahead with the index. If this overruns(泛滥成灾 超过)
 				// what is left we fall out and process split buffer.
 				// TODO
-				// i = c.as + c.pa.size - 1
+				i = c.as + c.pa.size - 1
 			default:
 				if c.argBuf != nil {
 					c.argBuf = append(c.argBuf, b)

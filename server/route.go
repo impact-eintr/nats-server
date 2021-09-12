@@ -1,6 +1,8 @@
 package server
 
-import "net/url"
+import (
+	"net/url"
+)
 
 type connectInfo struct {
 	Verbose  bool   `json:"verbose"`        // 是否关闭服务器的+OK冗余信息，+OK见下面的说明
@@ -14,6 +16,10 @@ type connectInfo struct {
 const (
 	_EMPTY_ = ""
 )
+
+type route struct {
+	remoteID string
+}
 
 // StartRouting will start the accept loop om the cluster host:port
 // and willl actively try to connect listed routes

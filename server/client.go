@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
@@ -16,6 +17,11 @@ const (
 	CLIENT = iota
 	// ROUTER is another router in the cluster
 	ROUTER
+)
+
+const (
+	ClientProtoZero = iota
+	ClientProtoInfo
 )
 
 // For controlling dynamic buffer sizes
@@ -74,6 +80,31 @@ type client struct {
 	// 这里client继承了协议解析状态机状态"parseState"。
 	// 因此可以将这里的readloop想象成一个对流处理的处理器
 	parseState
+
+	route *route
+	debug bool
+	trace bool
+
+	flags clientFlag // 将布尔值压缩到单个字段中。 需要时会增加尺寸
+}
+
+// Represent(代表) client cooleans with bitmask
+type clientFlag byte
+
+const (
+	connectReceived clientFlag = 1 << iota // The CONNECT proto has been received
+	firstPongSent                          // The first PONG has been sent
+	infoUpdated                            // The server's Info object has changed before first PONG was sent
+)
+
+// set the flag (would be equivalent to set the boolean to true)
+func (cf *clientFlag) set(c clientFlag) {
+	*cf |= c
+}
+
+// isSet returns true if the flag is set, false otherwise
+func (cf clientFlag) isSet(c clientFlag) bool {
+	return cf&c != 0
 }
 
 // Used in readloop to cache hot subject(主题) lookups and group statistics(统计值)
@@ -222,6 +253,127 @@ func (c *client) maxConnExceeded() {
 
 func (c *client) closeConnection() {
 
+}
+
+func (c *client) processConnect(arg []byte) error {
+	c.traceInOp("CONNECT", arg)
+
+	c.mu.Lock()
+	// if we can't stop the timer because the callback is in progress...
+	if !c.clearAuthTimer() {
+		// TODO
+	}
+	c.last = time.Now()
+	typ := c.typ
+	r := c.route
+	srv := c.srv
+
+	if err := json.Unmarshal(arg, &c.opts); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+
+	c.flags.set(connectReceived)
+	proto := c.opts.Protocol
+	verbose := c.opts.Verbose
+	lang := c.opts.Lang
+	c.mu.Unlock()
+
+	if srv != nil {
+		if proto >= ClientProtoInfo {
+			srv.mu.Lock()
+			srv.cproto++
+			srv.mu.Unlock()
+		}
+		// Check for Auth
+		if ok := srv.checkAuthorization(c); !ok {
+			// TODO
+		}
+	}
+
+	// Check client protocol request if it exists
+	if typ == CLIENT && (proto < ClientProtoZero || proto > ClientProtoInfo) {
+		c.sendErr(ErrBadClientProtocol.Error())
+		c.closeConnection()
+		return ErrBadClientProtocol
+	} else if typ == ROUTER && lang != "" {
+		c.sendErr(ErrClientConnectedToRoutePort.Error())
+		c.closeConnection()
+		return ErrClientConnectedToRoutePort
+	}
+
+	// Grab connection name of remote route
+	if typ == ROUTER && r != nil {
+		c.mu.Lock()
+		c.route.remoteID = c.opts.Name
+		c.mu.Unlock()
+	}
+
+	if verbose {
+		c.sendOK()
+	}
+	return nil
+
+}
+
+// Process the infomation message from Clients and other Routes
+func (c *client) processInfo(arg []byte) error {
+	info := Info{}
+	if err := json.Unmarshal(arg, &info); err != nil {
+		return err
+	}
+	if c.typ == ROUTER {
+		c.processRouteInfo(&info)
+	}
+	return nil
+}
+
+func (c *client) traceInOp(op string, arg []byte) {
+	c.traceOp("->> %s", op, arg)
+}
+
+func (c *client) traceOutOp(op string, arg []byte) {
+	c.traceOp("<<- %s", op, arg)
+}
+
+func (c *client) traceOp(format, op string, arg []byte) {
+	if !c.trace {
+		return
+	}
+
+	opa := []interface{}{}
+	if op != "" {
+		opa = append(opa, op)
+	}
+	if arg != nil {
+		opa = append(opa, string(arg))
+	}
+	c.Tracef(format, opa)
+}
+
+// Used to treat maps as efficient set
+var needFlush = struct{}{}
+var routeSeen = struct{}{}
+
+// Assume the lock is held upon entry.
+func (c *client) sendInfo(info []byte) {
+	c.sendProto(info, true)
+}
+
+func (c *client) sendErr(err string) {
+	c.mu.Lock()
+	c.traceOutOp("-ERR", []byte(err))
+	c.sendProto([]byte(fmt.Sprintf("-ERR '%s'\r\n", err)), true)
+	c.mu.Unlock()
+}
+
+func (c *client) sendOK() {
+	c.mu.Lock()
+	c.traceOutOp("OK", nil)
+	// Can not autoflush this one, needs to be async.
+	c.sendProto([]byte("+OK\r\n"), false)
+	c.pcd[c] = needFlush
+	c.mu.Unlock()
 }
 
 // Logging functionality scoped to a client or route.

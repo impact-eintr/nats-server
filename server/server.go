@@ -53,6 +53,7 @@ type Server struct {
 	//grTnpClients map[uint64]*client
 	grWG sync.WaitGroup // to wait on(服侍) various(各种各样的) goroutines
 
+	cproto int64 // number of clients supporting async INFO 支持异步信息的客户端数量
 	// 日志
 	logging struct {
 		sync.RWMutex
