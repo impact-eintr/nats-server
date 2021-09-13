@@ -31,6 +31,7 @@ type Server struct {
 
 	info     Info
 	infoJSON []byte
+	sl       *Sublist
 
 	// Server的配置信息
 	configFile string
@@ -43,9 +44,13 @@ type Server struct {
 	listener net.Listener
 
 	clients      map[uint64]*client
+	routes       map[string]*client
+	remotes      map[string]*client
+	users        map[string]*User
 	totalClients uint64
-	done         chan bool
-	start        time.Time
+
+	done  chan bool
+	start time.Time
 
 	// Server中的goroutine的的互斥锁
 	grMu      sync.Mutex

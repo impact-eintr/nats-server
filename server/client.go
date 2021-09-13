@@ -69,11 +69,14 @@ type client struct {
 	ncs   string
 	bw    *bufio.Writer
 	srv   *Server
+	subs  map[string]*subscription
+	perms *permissions
 	cache readCache
 
 	pcd  map[*client]struct{}
 	atmr *time.Timer
 	ptmr *time.Timer
+	pout int
 	wfc  int
 
 	last time.Time
@@ -86,6 +89,13 @@ type client struct {
 	trace bool
 
 	flags clientFlag // 将布尔值压缩到单个字段中。 需要时会增加尺寸
+}
+
+// 实际上就是一个保持了订阅主题和发布主题的列表
+type permissions struct {
+	sub    *Sublist
+	pub    *Sublist
+	pcache map[string]bool
 }
 
 // Represent(代表) client cooleans with bitmask
@@ -105,6 +115,19 @@ func (cf *clientFlag) set(c clientFlag) {
 // isSet returns true if the flag is set, false otherwise
 func (cf clientFlag) isSet(c clientFlag) bool {
 	return cf&c != 0
+}
+
+// unset the flag (would be equivalent to set the boolean to false)
+func (cf *clientFlag) clear(c clientFlag) {
+	*cf &= ^c
+}
+
+func (cf *clientFlag) setIfNotSet(c clientFlag) bool {
+	if *cf&c == 0 {
+		*cf |= c
+		return true
+	}
+	return false
 }
 
 // Used in readloop to cache hot subject(主题) lookups and group statistics(统计值)
@@ -287,7 +310,8 @@ func (c *client) processConnect(arg []byte) error {
 		}
 		// Check for Auth
 		if ok := srv.checkAuthorization(c); !ok {
-			// TODO
+			c.authViolation()
+			return ErrAuthorization
 		}
 	}
 
@@ -326,6 +350,150 @@ func (c *client) processInfo(arg []byte) error {
 		c.processRouteInfo(&info)
 	}
 	return nil
+}
+
+// argo: old arg
+func (c *client) processSub(argo []byte) (err error) {
+	c.traceInOp("SUB", argo)
+
+	//Indicate(表明) activity
+	c.cache.subs += 1
+
+	// Copy so we do not reference a potentially large buffer
+	arg := make([]byte, len(argo))
+	copy(arg, argo)
+	args := splitArg(arg)
+
+	// 了参数后会创建一个subscription订阅对象
+	sub := &subscription{client: c}
+	// 同时这里因为订阅组是可选的内容
+	switch len(args) {
+	case 2:
+		sub.subject = args[0]
+		sub.queue = nil
+		sub.sid = args[1]
+	case 3:
+		sub.subject = args[0]
+		sub.queue = args[1]
+		sub.sid = args[2]
+	default:
+		return fmt.Errorf("processSub Parse Error: %s", arg)
+	}
+
+	shouldForward := false
+
+	c.mu.Lock()
+	if c.nc == nil {
+		c.mu.Unlock()
+		return nil
+	}
+
+	// Check permissions if applicable.
+	if !c.canSubscribe(sub.subject) {
+		c.mu.Unlock()
+		c.sendErr(fmt.Sprintf("Permissions Violation for Subscription to %q", sub.subject))
+		c.Errorf("Subscription Violation - User %q, Subject %q, SID %s",
+			c.opts.Username, sub.subject, sub.sid)
+		return nil
+	}
+
+	// 然后对router转发做一个过滤，比如两个router转发了同一个客户端的请求，此时订阅ID是相同的
+	sid := string(sub.sid)
+	if c.subs[sid] == nil {
+		c.subs[sid] = sub
+		if c.srv != nil {
+			err = c.srv.sl.Insert(sub)
+			if err != nil {
+				delete(c.subs, sid)
+			} else {
+				shouldForward = c.typ != ROUTER
+			}
+		}
+	}
+	c.mu.Unlock()
+	if err != nil {
+		c.sendErr("Invalid Subject")
+		return nil
+	} else if c.opts.Verbose {
+		c.sendOK()
+	}
+	if shouldForward {
+		c.srv.broadcastSubscribe(sub)
+	}
+
+	return nil
+}
+
+func splitArg(arg []byte) [][]byte {
+	a := [MAX_MSG_ARGS][]byte{}
+	args := a[:0]
+	start := -1
+	for i, b := range arg {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			if start >= 0 {
+				args = append(args, arg[start:i])
+				start = -1
+			}
+		default:
+			if start < 0 {
+				start = i
+			}
+		}
+	}
+	if start >= 0 {
+		args = append(args, arg[start:])
+	}
+	return args
+}
+
+func (c *client) processPing() {
+	c.mu.Lock()
+	c.traceInOp("PING", nil)
+	if c.nc == nil {
+		c.mu.Unlock()
+		return
+	}
+	c.traceOutOp("PONG", nil)
+	err := c.sendProto([]byte("PONG\r\n"), true)
+	if err != nil {
+		c.clearConnection()
+		c.Debugf("Error on Flush, error %s", err.Error())
+	}
+	srv := c.srv
+	sendUpdateINFO := false
+	// Check if this is the first Pong, if so...
+	if c.flags.setIfNotSet(firstPongSent) {
+		// Check if server should send an async INFO protocol to the client
+		if c.opts.Protocol >= ClientProtoInfo &&
+			srv != nil && c.flags.isSet(infoUpdated) {
+			sendUpdateINFO = true
+		}
+		// We can now clear the flag
+		c.flags.clear(infoUpdated)
+	}
+	c.mu.Unlock()
+
+	// Some clients send an initial PING as part of the synchronous connect process.
+	// They can't be receiving anything until the first PONG is received.
+	// So we delay the possible update INFO after this point
+	if sendUpdateINFO {
+		srv.mu.Lock()
+		// Use the cached protocol
+		proto := srv.infoJSON
+		srv.mu.Unlock()
+
+		c.mu.Lock()
+		c.sendInfo(proto)
+		c.mu.Unlock()
+	}
+}
+
+func (c *client) processPong() {
+	c.traceInOp("PONG", nil)
+	c.mu.Lock()
+	c.pout = 0
+	c.mu.Unlock()
 }
 
 func (c *client) traceInOp(op string, arg []byte) {
@@ -374,6 +542,55 @@ func (c *client) sendOK() {
 	c.sendProto([]byte("+OK\r\n"), false)
 	c.pcd[c] = needFlush
 	c.mu.Unlock()
+}
+
+func (c *client) authTimeout() {
+	c.sendErr(ErrAuthTimeout.Error())
+	c.Debugf("Authorization Timeout")
+	c.closeConnection()
+}
+
+func (c *client) authViolation() {
+	if c.srv != nil && c.srv.getOpts().Users != nil {
+		c.Errorf("%s - User %q",
+			ErrAuthorization.Error(),
+			c.opts.Username)
+	} else {
+		c.Errorf(ErrAuthorization.Error())
+	}
+	c.sendErr("Authorization Violation")
+	c.closeConnection()
+}
+
+func (c *client) RegisterUser(user *User) {
+	if user.Permissions == nil {
+		// Reset perms to nil in case client previously had them
+		c.mu.Lock()
+		c.perms = nil
+		c.mu.Unlock()
+		return
+	}
+	// Process Permissions and map into client connection structures.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Pre-allocate all to simplify(简化) checks later.
+	c.perms = &permissions{}
+	c.perms.sub = NewSubList()
+	c.perms.pub = NewSubList()
+	c.perms.pcache = make(map[string]bool)
+
+	// Loop over publish permissions
+	for _, pubSubject := range user.Permissions.Publish {
+		sub := &subscription{subject: []byte(pubSubject)}
+		c.perms.pub.Insert(sub)
+	}
+
+	// Loop over subscribe permissions
+	for _, subSubject := range user.Permissions.Subscribe {
+		sub := &subscription{subject: []byte(subSubject)}
+		c.perms.sub.Insert(sub)
+	}
 }
 
 // Logging functionality scoped to a client or route.

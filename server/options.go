@@ -8,12 +8,16 @@ import (
 
 type Options struct {
 	// 基本配置
-	ConfigFile string `json:"-"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	Trace      bool   `json:"-"`
-	Debug      bool   `json:"-"`
-	MaxConn    int    `json:"max_connections"`
+	ConfigFile    string  `json:"-"`
+	Host          string  `json:"host"`
+	Port          int     `json:"port"`
+	Trace         bool    `json:"-"`
+	Debug         bool    `json:"-"`
+	MaxConn       int     `json:"max_connections"`
+	Users         []*User `json:"-"`
+	Username      string  `json:"-"`
+	Password      string  `json:"-"`
+	Authorization string  `json:"-"` // Authorization 授权
 
 	PingInterval time.Duration `json:"ping_interval"`
 	MaxPingsOut  int           `json:"ping_max"`
